@@ -6,13 +6,12 @@ Usage:
 """
 
 dependencies = ['torch', 'yaml']
-
 import os
 
 import torch
 
 from models.yolo import Model
-from utils import google_utils
+from utils.google_utils import attempt_download
 
 
 def create(name, pretrained, channels, classes):
@@ -32,14 +31,16 @@ def create(name, pretrained, channels, classes):
         model = Model(config, channels, classes)
         if pretrained:
             ckpt = '%s.pt' % name  # checkpoint filename
-            google_utils.attempt_download(ckpt)  # download if not found locally
+            attempt_download(ckpt)  # download if not found locally
             state_dict = torch.load(ckpt, map_location=torch.device('cpu'))['model'].float().state_dict()  # to FP32
             state_dict = {k: v for k, v in state_dict.items() if model.state_dict()[k].shape == v.shape}  # filter
             model.load_state_dict(state_dict, strict=False)  # load
         return model
+
     except Exception as e:
         help_url = 'https://github.com/ultralytics/yolov5/issues/36'
-        print('%s\nCache maybe be out of date. Delete cache and retry. See %s for help.' % (e, help_url))
+        s = 'Cache maybe be out of date, deleting cache and retrying may solve this. See %s for help.' % help_url
+        raise Exception(s) from e
 
 
 def yolov5s(pretrained=False, channels=3, classes=80):

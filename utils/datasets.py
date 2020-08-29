@@ -14,10 +14,10 @@ from PIL import Image, ExifTags
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from utils.utils import xyxy2xywh, xywh2xyxy
+from utils.general import xyxy2xywh, xywh2xyxy, torch_distributed_zero_first
 
 help_url = 'https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'
-img_formats = ['.bmp', '.jpg', '.jpeg', '.png', '.tif', '.dng']
+img_formats = ['.bmp', '.jpg', '.jpeg', '.png', '.tif', '.tiff', '.dng']
 vid_formats = ['.mov', '.avi', '.mp4', '.mpg', '.mpeg', '.m4v', '.wmv', '.mkv']
 
 # Get orientation exif tag
@@ -46,21 +46,27 @@ def exif_size(img):
     return s
 
 
-def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False):
-    dataset = LoadImagesAndLabels(path, imgsz, batch_size,
-                                  augment=augment,  # augment images
-                                  hyp=hyp,  # augmentation hyperparameters
-                                  rect=rect,  # rectangular training
-                                  cache_images=cache,
-                                  single_cls=opt.single_cls,
-                                  stride=int(stride),
-                                  pad=pad)
+def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
+                      rank=-1, world_size=1, workers=8):
+    # Make sure only the first process in DDP process the dataset first, and the following others can use the cache.
+    with torch_distributed_zero_first(rank):
+        dataset = LoadImagesAndLabels(path, imgsz, batch_size,
+                                      augment=augment,  # augment images
+                                      hyp=hyp,  # augmentation hyperparameters
+                                      rect=rect,  # rectangular training
+                                      cache_images=cache,
+                                      single_cls=opt.single_cls,
+                                      stride=int(stride),
+                                      pad=pad,
+                                      rank=rank)
 
     batch_size = min(batch_size, len(dataset))
-    nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8])  # number of workers
+    nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
+    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=batch_size,
                                              num_workers=nw,
+                                             sampler=train_sampler,
                                              pin_memory=True,
                                              collate_fn=LoadImagesAndLabels.collate_fn)
     return dataloader, dataset
@@ -229,7 +235,7 @@ class LoadStreams:  # multiple IP or RTSP cameras
         for i, s in enumerate(sources):
             # Start the thread to read frames from the video stream
             print('%g/%g: %s... ' % (i + 1, n, s), end='')
-            cap = cv2.VideoCapture(0 if s == '0' else s)
+            cap = cv2.VideoCapture(eval(s) if s.isnumeric() else s)
             assert cap.isOpened(), 'Failed to open %s' % s
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -287,7 +293,7 @@ class LoadStreams:  # multiple IP or RTSP cameras
 
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_images=False, single_cls=False, stride=32, pad=0.0):
+                 cache_images=False, single_cls=False, stride=32, pad=0.0, rank=-1):
         try:
             f = []  # image files
             for p in path if isinstance(path, list) else [path]:
@@ -301,7 +307,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     f += glob.iglob(p + os.sep + '*.*')
                 else:
                     raise Exception('%s does not exist' % p)
-            self.img_files = [x.replace('/', os.sep) for x in f if os.path.splitext(x)[-1].lower() in img_formats]
+            self.img_files = sorted(
+                [x.replace('/', os.sep) for x in f if os.path.splitext(x)[-1].lower() in img_formats])
         except Exception as e:
             raise Exception('Error loading data from %s: %s\nSee %s' % (path, e, help_url))
 
@@ -366,10 +373,12 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         # Cache labels
         create_datasubset, extract_bounding_boxes, labels_loaded = False, False, False
         nm, nf, ne, ns, nd = 0, 0, 0, 0, 0  # number missing, found, empty, datasubset, duplicate
-        pbar = tqdm(self.label_files)
-        for i, file in enumerate(pbar):
+        pbar = enumerate(self.label_files)
+        if rank in [-1, 0]:
+            pbar = tqdm(pbar)
+        for i, file in pbar:
             l = self.labels[i]  # label
-            if l.shape[0]:
+            if l is not None and l.shape[0]:
                 assert l.shape[1] == 5, '> 5 label columns: %s' % file
                 assert (l >= 0).all(), 'negative labels: %s' % file
                 assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
@@ -414,8 +423,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 ne += 1  # print('empty labels for image %s' % self.img_files[i])  # file empty
                 # os.system("rm '%s' '%s'" % (self.img_files[i], self.label_files[i]))  # remove
 
-            pbar.desc = 'Scanning labels %s (%g found, %g missing, %g empty, %g duplicate, for %g images)' % (
-                cache_path, nf, nm, ne, nd, n)
+            if rank in [-1, 0]:
+                pbar.desc = 'Scanning labels %s (%g found, %g missing, %g empty, %g duplicate, for %g images)' % (
+                    cache_path, nf, nm, ne, nd, n)
         if nf == 0:
             s = 'WARNING: No labels found in %s. See %s' % (os.path.dirname(file) + os.sep, help_url)
             print(s)
@@ -451,7 +461,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     l = np.zeros((0, 5), dtype=np.float32)
                 x[img] = [l, shape]
             except Exception as e:
-                x[img] = None
+                x[img] = [None, None]
                 print('WARNING: %s: %s' % (img, e))
 
         x['hash'] = get_hash(self.label_files + self.img_files)
@@ -478,11 +488,11 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             shapes = None
 
             # MixUp https://arxiv.org/pdf/1710.09412.pdf
-            # if random.random() < 0.5:
-            #     img2, labels2 = load_mosaic(self, random.randint(0, len(self.labels) - 1))
-            #     r = np.random.beta(0.3, 0.3)  # mixup ratio, alpha=beta=0.3
-            #     img = (img * r + img2 * (1 - r)).astype(np.uint8)
-            #     labels = np.concatenate((labels, labels2), 0)
+            if random.random() < hyp['mixup']:
+                img2, labels2 = load_mosaic(self, random.randint(0, len(self.labels) - 1))
+                r = np.random.beta(8.0, 8.0)  # mixup ratio, alpha=beta=8.0
+                img = (img * r + img2 * (1 - r)).astype(np.uint8)
+                labels = np.concatenate((labels, labels2), 0)
 
         else:
             # Load image
@@ -507,11 +517,12 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         if self.augment:
             # Augment imagespace
             if not self.mosaic:
-                img, labels = random_affine(img, labels,
-                                            degrees=hyp['degrees'],
-                                            translate=hyp['translate'],
-                                            scale=hyp['scale'],
-                                            shear=hyp['shear'])
+                img, labels = random_perspective(img, labels,
+                                                 degrees=hyp['degrees'],
+                                                 translate=hyp['translate'],
+                                                 scale=hyp['scale'],
+                                                 shear=hyp['shear'],
+                                                 perspective=hyp['perspective'])
 
             # Augment colorspace
             augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
@@ -522,27 +533,22 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
         nL = len(labels)  # number of labels
         if nL:
-            # convert xyxy to xywh
-            labels[:, 1:5] = xyxy2xywh(labels[:, 1:5])
-
-            # Normalize coordinates 0 - 1
-            labels[:, [2, 4]] /= img.shape[0]  # height
-            labels[:, [1, 3]] /= img.shape[1]  # width
+            labels[:, 1:5] = xyxy2xywh(labels[:, 1:5])  # convert xyxy to xywh
+            labels[:, [2, 4]] /= img.shape[0]  # normalized height 0-1
+            labels[:, [1, 3]] /= img.shape[1]  # normalized width 0-1
 
         if self.augment:
-            # random left-right flip
-            lr_flip = True
-            if lr_flip and random.random() < 0.5:
-                img = np.fliplr(img)
-                if nL:
-                    labels[:, 1] = 1 - labels[:, 1]
-
-            # random up-down flip
-            ud_flip = False
-            if ud_flip and random.random() < 0.5:
+            # flip up-down
+            if random.random() < hyp['flipud']:
                 img = np.flipud(img)
                 if nL:
                     labels[:, 2] = 1 - labels[:, 2]
+
+            # flip left-right
+            if random.random() < hyp['fliplr']:
+                img = np.fliplr(img)
+                if nL:
+                    labels[:, 1] = 1 - labels[:, 1]
 
         labels_out = torch.zeros((nL, 6))
         if nL:
@@ -562,6 +568,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         return torch.stack(img, 0), torch.cat(label, 0), path, shapes
 
 
+# Ancillary functions --------------------------------------------------------------------------------------------------
 def load_image(self, index):
     # loads 1 image from dataset, returns img, original hw, resized hw
     img = self.imgs[index]
@@ -649,12 +656,13 @@ def load_mosaic(self, index):
 
     # Augment
     # img4 = img4[s // 2: int(s * 1.5), s // 2:int(s * 1.5)]  # center crop (WARNING, requires box pruning)
-    img4, labels4 = random_affine(img4, labels4,
-                                  degrees=self.hyp['degrees'],
-                                  translate=self.hyp['translate'],
-                                  scale=self.hyp['scale'],
-                                  shear=self.hyp['shear'],
-                                  border=self.mosaic_border)  # border to remove
+    img4, labels4 = random_perspective(img4, labels4,
+                                       degrees=self.hyp['degrees'],
+                                       translate=self.hyp['translate'],
+                                       scale=self.hyp['scale'],
+                                       shear=self.hyp['shear'],
+                                       perspective=self.hyp['perspective'],
+                                       border=self.mosaic_border)  # border to remove
 
     return img4, labels4
 
@@ -709,13 +717,22 @@ def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scale
     return img, ratio, (dw, dh)
 
 
-def random_affine(img, targets=(), degrees=10, translate=.1, scale=.1, shear=10, border=(0, 0)):
+def random_perspective(img, targets=(), degrees=10, translate=.1, scale=.1, shear=10, perspective=0.0, border=(0, 0)):
     # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-10, 10))
-    # https://medium.com/uruvideo/dataset-augmentation-with-random-homographies-a8f4b44830d4
     # targets = [cls, xyxy]
 
     height = img.shape[0] + border[0] * 2  # shape(h,w,c)
     width = img.shape[1] + border[1] * 2
+
+    # Center
+    C = np.eye(3)
+    C[0, 2] = -img.shape[1] / 2  # x translation (pixels)
+    C[1, 2] = -img.shape[0] / 2  # y translation (pixels)
+
+    # Perspective
+    P = np.eye(3)
+    P[2, 0] = random.uniform(-perspective, perspective)  # x perspective (about y)
+    P[2, 1] = random.uniform(-perspective, perspective)  # y perspective (about x)
 
     # Rotation and Scale
     R = np.eye(3)
@@ -723,22 +740,31 @@ def random_affine(img, targets=(), degrees=10, translate=.1, scale=.1, shear=10,
     # a += random.choice([-180, -90, 0, 90])  # add 90deg rotations to small rotations
     s = random.uniform(1 - scale, 1 + scale)
     # s = 2 ** random.uniform(-scale, scale)
-    R[:2] = cv2.getRotationMatrix2D(angle=a, center=(img.shape[1] / 2, img.shape[0] / 2), scale=s)
-
-    # Translation
-    T = np.eye(3)
-    T[0, 2] = random.uniform(-translate, translate) * img.shape[1] + border[1]  # x translation (pixels)
-    T[1, 2] = random.uniform(-translate, translate) * img.shape[0] + border[0]  # y translation (pixels)
+    R[:2] = cv2.getRotationMatrix2D(angle=a, center=(0, 0), scale=s)
 
     # Shear
     S = np.eye(3)
     S[0, 1] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # x shear (deg)
     S[1, 0] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # y shear (deg)
 
+    # Translation
+    T = np.eye(3)
+    T[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * width  # x translation (pixels)
+    T[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * height  # y translation (pixels)
+
     # Combined rotation matrix
-    M = S @ T @ R  # ORDER IS IMPORTANT HERE!!
+    M = T @ S @ R @ P @ C  # order of operations (right to left) is IMPORTANT
     if (border[0] != 0) or (border[1] != 0) or (M != np.eye(3)).any():  # image changed
-        img = cv2.warpAffine(img, M[:2], dsize=(width, height), flags=cv2.INTER_LINEAR, borderValue=(114, 114, 114))
+        if perspective:
+            img = cv2.warpPerspective(img, M, dsize=(width, height), borderValue=(114, 114, 114))
+        else:  # affine
+            img = cv2.warpAffine(img, M[:2], dsize=(width, height), borderValue=(114, 114, 114))
+
+    # Visualize
+    # import matplotlib.pyplot as plt
+    # ax = plt.subplots(1, 2, figsize=(12, 6))[1].ravel()
+    # ax[0].imshow(img[:, :, ::-1])  # base
+    # ax[1].imshow(img2[:, :, ::-1])  # warped
 
     # Transform label coordinates
     n = len(targets)
@@ -746,7 +772,11 @@ def random_affine(img, targets=(), degrees=10, translate=.1, scale=.1, shear=10,
         # warp points
         xy = np.ones((n * 4, 3))
         xy[:, :2] = targets[:, [1, 2, 3, 4, 1, 4, 3, 2]].reshape(n * 4, 2)  # x1y1, x2y2, x1y2, x2y1
-        xy = (xy @ M.T)[:, :2].reshape(n, 8)
+        xy = xy @ M.T  # transform
+        if perspective:
+            xy = (xy[:, :2] / xy[:, 2:3]).reshape(n, 8)  # rescale
+        else:  # affine
+            xy = xy[:, :2].reshape(n, 8)
 
         # create new boxes
         x = xy[:, [0, 2, 4, 6]]
@@ -762,26 +792,28 @@ def random_affine(img, targets=(), degrees=10, translate=.1, scale=.1, shear=10,
         # h = (xy[:, 3] - xy[:, 1]) * reduction
         # xy = np.concatenate((x - w / 2, y - h / 2, x + w / 2, y + h / 2)).reshape(4, n).T
 
-        # reject warped points outside of image
+        # clip boxes
         xy[:, [0, 2]] = xy[:, [0, 2]].clip(0, width)
         xy[:, [1, 3]] = xy[:, [1, 3]].clip(0, height)
-        w = xy[:, 2] - xy[:, 0]
-        h = xy[:, 3] - xy[:, 1]
-        area = w * h
-        area0 = (targets[:, 3] - targets[:, 1]) * (targets[:, 4] - targets[:, 2])
-        ar = np.maximum(w / (h + 1e-16), h / (w + 1e-16))  # aspect ratio
-        i = (w > 2) & (h > 2) & (area / (area0 * s + 1e-16) > 0.2) & (ar < 20)
 
+        # filter candidates
+        i = box_candidates(box1=targets[:, 1:5].T * s, box2=xy.T)
         targets = targets[i]
         targets[:, 1:5] = xy[i]
 
     return img, targets
 
 
+def box_candidates(box1, box2, wh_thr=2, ar_thr=20, area_thr=0.1):  # box1(4,n), box2(4,n)
+    # Compute candidate boxes: box1 before augment, box2 after augment, wh_thr (pixels), aspect_ratio_thr, area_ratio
+    w1, h1 = box1[2] - box1[0], box1[3] - box1[1]
+    w2, h2 = box2[2] - box2[0], box2[3] - box2[1]
+    ar = np.maximum(w2 / (h2 + 1e-16), h2 / (w2 + 1e-16))  # aspect ratio
+    return (w2 > wh_thr) & (h2 > wh_thr) & (w2 * h2 / (w1 * h1 + 1e-16) > area_thr) & (ar < ar_thr)  # candidates
+
+
 def cutout(image, labels):
-    # https://arxiv.org/abs/1708.04552
-    # https://github.com/hysts/pytorch_cutout/blob/master/dataloader.py
-    # https://towardsdatascience.com/when-conventional-wisdom-fails-revisiting-data-augmentation-for-self-driving-cars-4831998c5509
+    # Applies image cutout augmentation https://arxiv.org/abs/1708.04552
     h, w = image.shape[:2]
 
     def bbox_ioa(box1, box2):
@@ -800,7 +832,6 @@ def cutout(image, labels):
         box2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1) + 1e-16
 
         # Intersection over box2 area
-
         return inter_area / box2_area
 
     # create random masks
@@ -827,7 +858,7 @@ def cutout(image, labels):
     return labels
 
 
-def reduce_img_size(path='../data/sm4/images', img_size=1024):  # from utils.datasets import *; reduce_img_size()
+def reduce_img_size(path='path/images', img_size=1024):  # from utils.datasets import *; reduce_img_size()
     # creates a new ./images_reduced folder with reduced size images of maximum size img_size
     path_new = path + '_reduced'  # reduced images path
     create_folder(path_new)
@@ -844,31 +875,7 @@ def reduce_img_size(path='../data/sm4/images', img_size=1024):  # from utils.dat
             print('WARNING: image failure %s' % f)
 
 
-def convert_images2bmp():  # from utils.datasets import *; convert_images2bmp()
-    # Save images
-    formats = [x.lower() for x in img_formats] + [x.upper() for x in img_formats]
-    # for path in ['../coco/images/val2014', '../coco/images/train2014']:
-    for path in ['../data/sm4/images', '../data/sm4/background']:
-        create_folder(path + 'bmp')
-        for ext in formats:  # ['.bmp', '.jpg', '.jpeg', '.png', '.tif', '.dng']
-            for f in tqdm(glob.glob('%s/*%s' % (path, ext)), desc='Converting %s' % ext):
-                cv2.imwrite(f.replace(ext.lower(), '.bmp').replace(path, path + 'bmp'), cv2.imread(f))
-
-    # Save labels
-    # for path in ['../coco/trainvalno5k.txt', '../coco/5k.txt']:
-    for file in ['../data/sm4/out_train.txt', '../data/sm4/out_test.txt']:
-        with open(file, 'r') as f:
-            lines = f.read()
-            # lines = f.read().replace('2014/', '2014bmp/')  # coco
-            lines = lines.replace('/images', '/imagesbmp')
-            lines = lines.replace('/background', '/backgroundbmp')
-        for ext in formats:
-            lines = lines.replace(ext, '.bmp')
-        with open(file.replace('.txt', 'bmp.txt'), 'w') as f:
-            f.write(lines)
-
-
-def recursive_dataset2bmp(dataset='../data/sm4_bmp'):  # from utils.datasets import *; recursive_dataset2bmp()
+def recursive_dataset2bmp(dataset='path/dataset_bmp'):  # from utils.datasets import *; recursive_dataset2bmp()
     # Converts dataset to bmp (for faster training)
     formats = [x.lower() for x in img_formats] + [x.upper() for x in img_formats]
     for a, b, files in os.walk(dataset):
@@ -888,7 +895,7 @@ def recursive_dataset2bmp(dataset='../data/sm4_bmp'):  # from utils.datasets imp
                     os.system("rm '%s'" % p)
 
 
-def imagelist2folder(path='data/coco_64img.txt'):  # from utils.datasets import *; imagelist2folder()
+def imagelist2folder(path='path/images.txt'):  # from utils.datasets import *; imagelist2folder()
     # Copies all the images in a text file (list of images) into a folder
     create_folder(path[:-4])
     with open(path, 'r') as f:
@@ -897,7 +904,7 @@ def imagelist2folder(path='data/coco_64img.txt'):  # from utils.datasets import 
             print(line)
 
 
-def create_folder(path='./new_folder'):
+def create_folder(path='./new'):
     # Create folder
     if os.path.exists(path):
         shutil.rmtree(path)  # delete output folder
